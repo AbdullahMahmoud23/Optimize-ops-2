@@ -847,576 +847,211 @@ const handleShiftHandover = async (taskId, achievement) => {
 
 };
 
-/**
- * Execute rollover decisions made by the AI (with Cascade support)
- * @param {Array} decisions - Array of AI decisions
- * @param {Object} context - Context with shift/date info
- * @param {Array} cascadeChain - Optional cascade chain from AI
- * @returns {Object} Execution result
- */
-const executeAIRolloverDecisions = async (decisions, context, cascadeChain = []) => {
+
+const executeAIRolloverDecisions = async (decisions, context) => {
     const results = [];
-    const cascadeQueue = []; // 🔧 FIX: Declare cascadeQueue at function start to avoid ReferenceError
-    const { nextShiftName, nextShiftDate, tasks } = context;
+    const cascadeQueue = []; // The "Domino" Queue
 
-    console.log('🔄 Executing AI Rollover Decisions (Cascade Mode)...');
-    console.log(`   Next Shift: ${nextShiftName} on ${nextShiftDate}`);
+    // Helper: Normalize product names for matching
+    const productsMatch = (p1, p2) => {
+        if (!p1 || !p2) return false;
+        const n1 = p1.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const n2 = p2.toLowerCase().replace(/[^a-z0-9]/g, '');
+        return n1.includes(n2) || n2.includes(n1);
+    };
 
-
+    // 1. PROCESS INITIAL DECISIONS (The Triggers)
     for (const decision of decisions) {
         try {
-            // Debug: Log each decision being processed
-            console.log(`\n🔄 Processing decision for task ${decision.taskId}:`);
-            console.log(`   Action: ${decision.action}`);
-            console.log(`   Product: ${decision.productName}`);
-            console.log(`   AmountToTransfer: ${decision.amountToTransfer}`);
-            console.log(`   TimeToTransfer: ${decision.timeToTransfer}`);
-
-            if (decision.action === 'none') {
-                console.log(`⏭️ Skipping task ${decision.taskId}: ${decision.reason}`);
-                results.push({ taskId: decision.taskId, status: 'skipped', reason: decision.reason });
-                continue;
-            }
-
-            // Find the original task
-            const originalTask = tasks.find(t => t.task_id === decision.taskId);
-            if (!originalTask) {
-                console.warn(`⚠️ Task ${decision.taskId} not found`);
-                results.push({ taskId: decision.taskId, status: 'error', reason: 'Task not found' });
-                continue;
-            }
-
-            const amountToTransfer = decision.amountToTransfer;
-            const timeToTransfer = decision.timeToTransfer;
-
+            const { nextShiftName, nextShiftDate } = getNextShift(context.currentShift, context.currentDate);
+            
+            // ====================================================
+            // SCENARIO A: SHORTAGE -> ROLLOVER (The Domino)
+            // ====================================================
             if (decision.action === 'rollover') {
-                // ====================================================
-                // 1. CASE: SHORTAGE (ROLLOVER -> PUSH TO NEXT)
-                // ====================================================
-                console.log(`📉 Processing Rollover: ${amountToTransfer} units of ${decision.productName}`);
+                const amountToTransfer = decision.amountToTransfer;
 
-                // Clean product name
-                const cleanProductName = decision.productName
-                    .replace(/\d+\.?\d*\s*(كيلو|طن|kilometer|ton)/gi, '')
-                    .replace(/\[.*?\]|\(.*?\)/g, '')
-                    .trim();
+                // Clean Product Name
+                const cleanName = decision.productName.replace(/\[.*?\]|\(.*?\)/g, '').trim();
 
-                // 1. Get Next Shift State (Check Capacity)
-                const { data: nextShiftTasks } = await supabase
+                // A. Check Next Shift Capacity
+                const { data: nextTasks } = await supabase
                     .from('tasks')
                     .select('*')
-                    .eq('date', nextShiftDate)
+                    .eq('date', nextShiftDate.toISOString().split('T')[0])
                     .eq('shift', nextShiftName);
 
-                // Calculate Available Capacity
-                const currentShiftHours = (nextShiftTasks || []).reduce((sum, t) => sum + (parseFloat(t.target_hours) || 0), 0);
-                const { getShiftDuration } = require('../aiLogic');
-                // Get dynamic duration (12h for Friday, 8h for others)
-                const SHIFT_CAPACITY = (getShiftDuration ? getShiftDuration(nextShiftDate) / 60 : 8); 
-                const availableHours = Math.max(0, SHIFT_CAPACITY - currentShiftHours);
+                // Calculate Capacity
+                const totalHours = (nextTasks || []).reduce((sum, t) => sum + (t.target_hours || 0), 0);
+                const shiftMaxHours = nextShiftName.includes('Friday') ? 12 : 8; // Simple rule, or use getShiftConfig
+                const availableHours = Math.max(0, shiftMaxHours - totalHours);
 
-                console.log(`   📊 Next Shift Capacity: ${currentShiftHours.toFixed(2)}/${SHIFT_CAPACITY}h (Available: ${availableHours.toFixed(2)}h)`);
-
-                // Find if the task already exists in next shift
-                const existingTask = (nextShiftTasks || []).find(t => 
-                    productsMatch(t.target_description, decision.productName)
-                );
-
-                // Determine Production Rate
-                const originalTask = tasks.find(t => t.task_id === decision.taskId);
-                let productRate = parseFloat(existingTask?.production_rate) || parseFloat(originalTask?.production_rate);
+                // Calculate Time Needed
+                // Try to find rate from existing task, or context, or fallback
+                const existingTask = (nextTasks || []).find(t => productsMatch(t.target_description, cleanName));
+                let rate = existingTask?.production_rate || 
+                        context.tasks?.find(t => t.taskId === decision.taskId)?.productionRate || 
+                        100;
                 
-                if (!productRate || productRate <= 0) {
-                    productRate = timeToTransfer > 0 ? amountToTransfer / timeToTransfer : 100; // Fallback
-                }
+                const hoursNeeded = amountToTransfer / rate;
 
-                // 2. LOGIC: How much fits? How much cascades?
-                const hoursNeeded = timeToTransfer;
+                // B. Split the Load: What fits? vs What overflows?
+                const hoursToAdd = Math.min(hoursNeeded, availableHours);
+                const amountToAdd = Math.floor(hoursToAdd * rate);
                 
-                // Only fill what fits in the available space
-                // If availableHours is 0, EVERYTHING cascades.
-                const hoursToAdd = Math.min(hoursNeeded, availableHours); 
-                const amountToAdd = Math.round(hoursToAdd * productRate);
-                
-                // Calculate Overflow (The Cascade Part)
                 const overflowHours = hoursNeeded - hoursToAdd;
                 const overflowAmount = amountToTransfer - amountToAdd;
 
-                // A. MODIFY NEXT SHIFT (Fill it up)
+                // C. Fill the Next Shift (If space exists)
                 if (amountToAdd > 0) {
                     if (existingTask) {
-                        // Merge with existing task
-                        const newAmount = parseFloat(existingTask.target_amount) + amountToAdd;
-                        const newHours = parseFloat(existingTask.target_hours || 0) + hoursToAdd;
-                        const newDesc = `${cleanProductName} ${newAmount} ${existingTask.target_unit}`;
-
+                        // Merge
                         await executeWithRetry(() => supabase.from('tasks').update({
-                            target_amount: newAmount,
-                            target_hours: newHours,
-                            target_description: newDesc,
-                            is_rollover: true,
-                            priority: 0 // Rollover is high priority
+                            target_amount: existingTask.target_amount + amountToAdd,
+                            target_hours: existingTask.target_hours + hoursToAdd,
+                            target_description: `${cleanName} ${existingTask.target_amount + amountToAdd} [Rollover]`
                         }).eq('task_id', existingTask.task_id));
-                        
-                        console.log(`   ✅ Merged ${amountToAdd} units into Shift 2 (Task ${existingTask.task_id})`);
                     } else {
-                        // Create new task
+                        // Insert
                         await executeWithRetry(() => supabase.from('tasks').insert({
                             date: nextShiftDate,
                             shift: nextShiftName,
                             target_amount: amountToAdd,
-                            target_unit: originalTask?.target_unit || 'كيلو',
                             target_hours: hoursToAdd,
-                            target_description: `${cleanProductName} ${amountToAdd} ${originalTask?.target_unit || 'كيلو'} [Rollover]`,
-                            production_rate: productRate,
-                            is_rollover: true,
-                            priority: 0
+                            target_unit: 'kg', // Default or fetch from context
+                            target_description: `${cleanName} ${amountToAdd} [Rollover]`,
+                            production_rate: rate,
+                            priority: 0, // High priority
+                            is_rollover: true
                         }));
-                        
-                        console.log(`   ✅ Created new task in Shift 2 (${amountToAdd} units)`);
                     }
+                    console.log(`   ✅ Moved ${amountToAdd} units to ${nextShiftName}`);
                 }
 
-                // B. CASCADE OVERFLOW (Push to Shift 3)
+                // D. Trigger Cascade for Overflow
                 if (overflowAmount > 0) {
-                    console.log(`   🌊 Shift 2 Full! Cascading ${overflowAmount} units (${overflowHours.toFixed(2)}h) to future...`);
-                    
-                    // Add to cascade queue so the 'while' loop at the end of the function handles it
                     cascadeQueue.push({
-                        productName: cleanProductName,
+                        productName: cleanName,
                         amount: overflowAmount,
                         time: overflowHours,
-                        rate: productRate,
-                        unit: originalTask?.target_unit || 'كيلو',
+                        rate: rate,
                         fromShift: nextShiftName,
-                        fromDate: nextShiftDate, // Start searching AFTER Shift 2
-                        reason: `Capacity overflow from rollover`,
-                        depth: 0
+                        fromDate: nextShiftDate
                     });
                 }
 
-                results.push({
-                    taskId: decision.taskId,
-                    status: 'processed',
-                    addedToNext: amountToAdd,
-                    cascaded: overflowAmount
-                });
-            } else if (decision.action === 'balance') {
-                
-                let flame = decision.amountToTransfer; // The Surplus Amount
-                console.log(`🔥 Extinguishing Queue: Burning ${flame} units of ${decision.productName} from future schedule`);
+                results.push({ taskId: decision.taskId, status: 'rolled_over', cascaded: overflowAmount > 0 });
+            }
 
-                // 1. Clean product name for searching
-                const cleanName = decision.productName
-                    .replace(/\d+\.?\d*\s*(كيلو|طن|kilometer|ton)/gi, '')
-                    .replace(/\[.*?\]|\(.*?\)/g, '')
-                    .trim();
+            // SCENARIO B: SURPLUS -> BALANCE (The Extinguisher)
+            else if (decision.action === 'balance') {
+                let flame = decision.amountToTransfer;
 
-                // 2. Fetch THE ENTIRE QUEUE (All future tasks for this product)
-                // We order by Date ASC so we burn the nearest shift first (Shift 2, then Shift 3...)
-                const { data: futureQueue } = await supabase
+                const cleanName = decision.productName.replace(/\[.*?\]|\(.*?\)/g, '').trim();
+
+                // A. Fetch The ENTIRE Future Queue
+                const { data: futureTasks } = await supabase
                     .from('tasks')
                     .select('*')
-                    .gt('date', nextShiftDate) // Tasks strictly in the future (after current shift)
-                    .or(`target_description.ilike.%${cleanName}%,target_description.ilike.%${decision.productName}%`)
+                    .gt('date', context.currentDate)
                     .order('date', { ascending: true })
-                    .order('shift', { ascending: true }); // Standard shift order if dates are equal
+                    .order('shift', { ascending: true });
 
-                // Filter manually to ensure precise matching using our helper
-                // (SQL ilike might be too loose or miss normalization)
-                const targetQueue = (futureQueue || []).filter(t => 
-                    productsMatch(t.target_description, decision.productName)
-                );
-                
-                // Add Next Shift tasks explicitly if not covered by 'gt' query (e.g. same day next shift)
-                // (The previous query might miss the immediate next shift depending on time logic, 
-                // so we fetch next shift specifically to be safe)
-                const { data: nextShiftTasks } = await supabase
-                    .from('tasks')
-                    .select('*')
-                    .eq('date', nextShiftDate)
-                    .eq('shift', nextShiftName);
-                
-                const nextShiftMatches = (nextShiftTasks || []).filter(t => 
-                    productsMatch(t.target_description, decision.productName)
-                );
-                
-                // Combine: Next Shift First, Then Distant Future
-                const fullQueue = [...nextShiftMatches, ...targetQueue];
-                
-                // Deduplicate (in case of overlap) based on task_id
-                const uniqueQueue = Array.from(new Map(fullQueue.map(item => [item.task_id, item])).values());
+                // Filter for matching product
+                const targetQueue = (futureTasks || []).filter(t => productsMatch(t.target_description, cleanName));
 
-                // Sort again to be strictly chronological
-                uniqueQueue.sort((a, b) => {
-                    if (a.date !== b.date) return new Date(a.date) - new Date(b.date);
-                    // Simple shift sort (First < Second < Third)
-                    const order = { 'First Shift': 1, 'Second Shift': 2, 'Third Shift': 3 };
-                    return (order[a.shift] || 0) - (order[b.shift] || 0);
-                });
+                // B. Extinguish Loop
+                for (const task of targetQueue) {
+                    if (flame <= 0) break;
 
-                console.log(`   📋 Found ${uniqueQueue.length} future tasks in the queue to extinguish.`);
-
-                // 3. THE EXTINGUISHING LOOP
-                for (const task of uniqueQueue) {
-                    if (flame <= 0) break; // Stop if surplus is fully used
-
-                    const taskAmount = parseFloat(task.target_amount);
-                    
-                    if (taskAmount <= flame) {
-                        // 🔥 FULL BURN: Surplus is bigger than this task -> Delete it completely
-                        await executeWithRetry(
-                            () => supabase.from('tasks').delete().eq('task_id', task.task_id),
-                            3, 500, `Delete task ${task.task_id}`
-                        );
-                        
-                        console.log(`      ❌ Burned (Deleted) task ${task.task_id} in ${task.shift} (${taskAmount} units)`);
-                        
-                        // Log event
-                        await logRolloverEvent({
-                            taskId: decision.taskId,
-                            description: task.target_description,
-                            actionType: 'queue_extinguish_delete',
-                            nextShift: task.shift,
-                            nextDate: task.date,
-                            details: `Fully covered by surplus. Removed ${taskAmount} units.`
-                        });
-
-                        flame -= taskAmount; // Decrease flame, continue to next task
+                    if (task.target_amount <= flame) {
+                        // Fully Burned -> Delete
+                        await executeWithRetry(() => supabase.from('tasks').delete().eq('task_id', task.task_id));
+                        console.log(`   ❌ Deleted task in ${task.shift} (${task.target_amount} units)`);
+                        flame -= task.target_amount;
                     } else {
-                        // ✂️ PARTIAL BURN: Surplus covers only part of this task -> Reduce it
-                        const remainingAmount = taskAmount - flame;
-                        const taskRate = parseFloat(task.production_rate) || (taskAmount / (parseFloat(task.target_hours)||1));
-                        const newHours = remainingAmount / taskRate;
+                        // Partially Burned -> Reduce
+                        const newAmount = task.target_amount - flame;
+                        const newHours = newAmount / (task.production_rate || 100);
                         
-                        // Update text description
-                        const newDesc = `${cleanName} ${remainingAmount} ${task.target_unit || 'كيلو'}`;
+                        await executeWithRetry(() => supabase.from('tasks').update({
+                            target_amount: newAmount,
+                            target_hours: newHours,
+                            target_description: `${cleanName} ${newAmount} [Reduced]`
+                        }).eq('task_id', task.task_id));
                         
-                        await executeWithRetry(
-                            () => supabase.from('tasks').update({
-                                target_amount: remainingAmount,
-                                target_hours: newHours,
-                                target_description: newDescription
-                            }).eq('task_id', task.task_id),
-                            3, 500, `Update task ${task.task_id}`
-                        );
-
-                        console.log(`      📉 Reduced task ${task.task_id} in ${task.shift} to ${remainingAmount} units (Burned ${flame})`);
-
-                        await logRolloverEvent({
-                            taskId: decision.taskId,
-                            description: task.target_description,
-                            actionType: 'queue_extinguish_reduce',
-                            nextShift: task.shift,
-                            nextDate: task.date,
-                            details: `Partially covered by surplus. Reduced by ${flame} units.`
-                        });
-
-                        flame = 0; // Flame is out
+                        console.log(`   ✂️ Reduced task in ${task.shift} to ${newAmount}`);
+                        flame = 0;
                     }
                 }
-
-                // If flame is still > 0 here, it means the technician produced MORE than the entire scheduled order!
-                if (flame > 0) {
-                    console.log(`   ⚠️ Surplus remaining (${flame}) after extinguishing all future tasks. Order is done ahead of schedule!`);
-                    results.push({
-                        taskId: decision.taskId,
-                        status: 'order_complete',
-                        message: `Order finished with ${flame} units extra!`
-                    });
-                } else {
-                    results.push({
-                        taskId: decision.taskId,
-                        status: 'balanced',
-                        message: `Queue adjusted successfully.`
-                    });
-                }
+                results.push({ taskId: decision.taskId, status: 'balanced', remainingSurplus: flame });
             }
+
         } catch (err) {
-            console.error(`❌ Error executing decision for task ${decision.taskId}:`, err.message);
-            results.push({ taskId: decision.taskId, status: 'error', reason: err.message });
+            console.error(`❌ Decision Logic Error:`, err);
         }
     }
 
-    // STEP 3: Execute Cascade Chain
-    // ✅ FIX: Only cascade the DEDUCTIONS made in STEP 2 (not the rollovers themselves)
-    // The AI's cascadeChain often duplicates rollover decisions, so we build our own queue
 
-
-    // Build cascade queue from deductions only (not from AI's cascadeChain)
-    // cascadeQueue is already declared at function start
-    let processedCascades = new Set();
-
-
-    // Add deductions from decisions to cascade queue
-    for (const decision of decisions) {
-        if (decision.action === 'rollover' && decision.deductFromNextShift) {
-            const deduct = decision.deductFromNextShift;
-            // Skip if this is same product as rollover (no cascade needed)
-            if (deduct.productName !== decision.productName && deduct.amount > 0) {
-                // 🔧 FIX 1: Require explicit time/rate - no arbitrary fallbacks
-                if (!deduct.time || deduct.time <= 0) {
-                    console.warn(`⚠️ Cascade skipped for ${deduct.productName}: missing time/rate data`);
-                    await logRolloverEvent({
-                        taskId: decision.taskId,
-                        description: deduct.productName,
-                        actionType: 'FAILED_MISSING_RATE',
-                        details: `Cascade skipped: deduction has no time/rate (amount: ${deduct.amount})`
-                    });
-                    continue;
-                }
-                cascadeQueue.push({
-                    fromShift: nextShiftName,
-                    toShift: null, // Will be calculated
-                    productName: deduct.productName,
-                    amount: deduct.amount,
-                    time: deduct.time,
-                    rate: deduct.rate || (deduct.amount / deduct.time), // Calculate rate from amount/time
-                    unit: deduct.unit || 'كيلو', // 🔧 FIX 2: Preserve unit
-                    reason: 'deducted_for_rollover',
-                    depth: 0
-                });
-            }
-        }
-    }
-
-    const MAX_SHIFT_HOURS = 8;
-    const MAX_ITERATIONS = 50;
-    const MAX_CASCADE_DEPTH = 10;
-    const OPERATION_TIMEOUT = 30000; // 🔧 FIX 4: 30 seconds timeout for entire cascade operation
-    const cascadeStartTime = Date.now();
-    let iterationCount = 0;
-
-    while (cascadeQueue.length > 0 && iterationCount < MAX_ITERATIONS) {
-        const cascade = cascadeQueue.shift();
-        iterationCount++;
-
-        // 🔧 FIX 4: Check operation timeout
-        const elapsedTime = Date.now() - cascadeStartTime;
-        if (elapsedTime > OPERATION_TIMEOUT) {
-            console.warn(`⏱️ Cascade operation timeout exceeded (${(elapsedTime / 1000).toFixed(1)}s). Stopping cascade.`);
-            console.log(`   Remaining cascades: ${cascadeQueue.length} (not processed)`);
-            break;
-        }
-
-        // Check cascade depth
-        const cascadeDepth = cascade.depth || 0;
-        if (cascadeDepth > MAX_CASCADE_DEPTH) {
-            console.log(`⚠️ Skipping cascade (max depth ${MAX_CASCADE_DEPTH} reached): ${cascade.productName}`);
-            continue;
-        }
+    // This loop handles the overflow from Scenario A
+    let loops = 0;
+    while (cascadeQueue.length > 0 && loops < 20) {
+        const item = cascadeQueue.shift();
+        loops++;
 
         try {
-            // Sanitize shift names
-            const cleanFromShift = cascade.fromShift.replace(/\s*\(.*?\).*$/, '').trim();
-
-            // Deduplication check
-            const cascadeKey = `${cleanFromShift}|${cascade.productName}|${Math.round(cascade.amount)}`;
-            if (processedCascades.has(cascadeKey)) {
-                console.log(`⏭️ Skipping duplicate cascade: ${cascadeKey}`);
-                continue;
-            }
-            processedCascades.add(cascadeKey);
-
-            // Calculate target shift
-            const { nextShiftName: cascadeShiftName, nextShiftDate: cascadeShiftDateObj } =
-                getNextShift(cleanFromShift, nextShiftDate);
-            const cascadeDateStr = cascadeShiftDateObj.toISOString().split('T')[0];
-
-            console.log(`🔗 Cascade ${iterationCount}/${MAX_ITERATIONS} [Depth: ${cascadeDepth}]`);
-            console.log(`   ${cleanFromShift} → ${cascadeShiftName}: ${cascade.amount} ${cascade.productName} (${cascade.time}h)`);
-
-            // Get current capacity of target shift
-            const { data: targetShiftTasks } = await supabase
+            // Find Next Shift relative to the ITEM's date/shift
+            const { nextShiftName, nextShiftDate } = getNextShift(item.fromShift, item.fromDate);
+            
+            // Check Capacity of THIS new shift
+            const { data: checkTasks } = await supabase
                 .from('tasks')
                 .select('target_hours')
-                .eq('date', cascadeDateStr)
-                .eq('shift', cascadeShiftName);
+                .eq('date', nextShiftDate.toISOString().split('T')[0])
+                .eq('shift', nextShiftName);
 
-            const currentHours = (targetShiftTasks || []).reduce((sum, t) => sum + parseFloat(t.target_hours || 0), 0);
-            const availableCapacity = MAX_SHIFT_HOURS - currentHours;
+            const used = (checkTasks || []).reduce((s, t) => s + t.target_hours, 0);
+            const limit = nextShiftName.includes('Friday') ? 12 : 8;
+            const free = Math.max(0, limit - used);
 
-            console.log(`   📊 ${cascadeShiftName} capacity: ${currentHours.toFixed(2)}h / ${MAX_SHIFT_HOURS}h (available: ${availableCapacity.toFixed(2)}h)`);
+            // Fit logic
+            const hoursNeeded = item.amount / item.rate;
+            const hoursIn = Math.min(hoursNeeded, free);
+            const amountIn = Math.floor(hoursIn * item.rate);
+            
+            // Overflow logic
+            const remAmount = item.amount - amountIn;
 
-            // PRIORITY LOGIC: Rollover takes precedence
-            // If capacity is insufficient, we DEDUCT from existing tasks to make room and cascade them
-            if (cascade.time > availableCapacity) {
-                console.log(`   ⚠️ Rollover needs ${cascade.time.toFixed(2)}h but only ${availableCapacity.toFixed(2)}h available. Deducting from tasks...`);
-
-                const neededTime = cascade.time - availableCapacity;
-                let freedTime = 0;
-
-                const { data: currentTasks } = await supabase
-                    .from('tasks')
-                    .select('*')
-                    .eq('date', cascadeDateStr)
-                    .eq('shift', cascadeShiftName)
-                    .order('priority', { ascending: false }); // Lowest priority first
-
-                for (const task of (currentTasks || [])) {
-                    if (freedTime >= neededTime - 0.01) break;
-
-                    const taskHours = parseFloat(task.target_hours || 0);
-                    if (taskHours <= 0) continue;
-
-                    // Skip same product as cascade to avoid recursion
-                    const taskProductName = task.target_description
-                        .replace(/\d+\.?\d*\s*(كيلو|طن)/gi, '')
-                        .replace(/\(.*?\)/g, '')
-                        .trim();
-                    if (taskProductName === cascade.productName) continue;
-
-                    const timeToDeduct = Math.min(taskHours, neededTime - freedTime);
-                    const amountToDeduct = Math.round((parseFloat(task.target_amount) / taskHours) * timeToDeduct);
-
-                    console.log(`      🔻 Deducting ${amountToDeduct} units (${timeToDeduct.toFixed(2)}h) from: ${task.target_description}`);
-
-                    const newAmt = Math.max(0, parseFloat(task.target_amount) - amountToDeduct);
-                    const newHrs = Math.max(0, taskHours - timeToDeduct);
-
-                    if (newHrs < 0.05) {
-                        // Delete if less than 3 minutes
-                        await supabase.from('tasks').delete().eq('task_id', task.task_id);
-                        console.log(`         ✖ Deleted task (no time remaining)`);
-                    } else {
-                        await supabase.from('tasks').update({
-                            target_amount: newAmt,
-                            target_hours: newHrs,
-                            target_description: `${taskProductName} ${newAmt} ${task.target_unit}`
-                        }).eq('task_id', task.task_id);
-                        console.log(`         ↓ Reduced to ${newAmt} units`);
-                    }
-
-                    freedTime += timeToDeduct;
-
-                    // Cascade deducted task to next shift
-                    const { nextShiftName: cascadeNextShift, nextShiftDate: cascadeNextDate } = getNextShift(cascadeShiftName, cascadeDateStr);
-
-                    // 🔧 FIX 2: Preserve unit and rate in cascade
-                    cascadeQueue.push({
-                        fromShift: cascadeShiftName,
-                        toShift: cascadeNextShift,
-                        productName: taskProductName,
-                        amount: amountToDeduct,
-                        time: timeToDeduct,
-                        rate: parseFloat(task.target_amount) / parseFloat(task.target_hours || 1), // Preserve production rate
-                        unit: task.target_unit || 'كيلو', // Preserve original unit
-                        reason: 'deducted_to_make_space',
-                        depth: cascadeDepth + 1
-                    });
-                }
-                console.log(`      ✅ Freed ${freedTime.toFixed(2)}h of ${neededTime.toFixed(2)}h needed`);
+            if (amountIn > 0) {
+                // Insert into this shift
+                await executeWithRetry(() => supabase.from('tasks').insert({
+                    date: nextShiftDate,
+                    shift: nextShiftName,
+                    target_amount: amountIn,
+                    target_hours: hoursIn,
+                    target_description: `${item.productName} ${amountIn} [Cascade]`,
+                    production_rate: item.rate,
+                    priority: 0,
+                    is_rollover: true
+                }));
             }
 
-            // Insert/Merge the rollover task
-            const { data: refreshTasks } = await supabase
-                .from('tasks')
-                .select('target_hours')
-                .eq('date', cascadeDateStr)
-                .eq('shift', cascadeShiftName);
-
-            const currentHrsRefresh = (refreshTasks || []).reduce((sum, t) => sum + parseFloat(t.target_hours || 0), 0);
-            const realAvailable = MAX_SHIFT_HOURS - currentHrsRefresh;
-
-            let actualTimeToAdd = Math.min(cascade.time, realAvailable);
-            if (realAvailable > cascade.time - 0.05) actualTimeToAdd = cascade.time;
-
-            let actualAmountToAdd = Math.round(cascade.amount * (actualTimeToAdd / cascade.time));
-
-            if (actualTimeToAdd > 0.01) {
-                const cleanProductName = cascade.productName
-                    .replace(/\[CASCADE\]/g, '')
-                    .replace(/\d+\.?\d*\s*(كيلو|طن)/gi, '')
-                    .replace(/\(.*?\)/g, '')
-                    .trim();
-
-                // 🔧 FIX 3: Use normalized product matching instead of fuzzy ilike
-                // Fetch all tasks for the shift, then filter with precise matching
-                const { data: shiftTasks } = await supabase
-                    .from('tasks')
-                    .select('*')
-                    .eq('date', cascadeDateStr)
-                    .eq('shift', cascadeShiftName);
-
-                // Find exact match using normalized comparison
-                const existingCascade = (shiftTasks || []).find(t =>
-                    productsMatch(t.target_description, cleanProductName)
-                );
-
-                if (existingCascade) {
-                    const newAmt = parseFloat(existingCascade.target_amount) + actualAmountToAdd;
-                    const newHrs = parseFloat(existingCascade.target_hours || 0) + actualTimeToAdd;
-                    const newDescription = `${cleanProductName} ${newAmt} ${existingCascade.target_unit || 'كيلو'}`;
-
-                    await supabase
-                        .from('tasks')
-                        .update({
-                            target_amount: newAmt,
-                            target_hours: newHrs,
-                            target_description: newDescription,
-                            is_rollover: true,
-                            priority: 0
-                        })
-                        .eq('task_id', existingCascade.task_id);
-                    console.log(`   ✓ Merged rollover into ${existingCascade.task_id} (now ${newAmt})`);
-                } else {
-                    // 🔧 FIX 2 & 5: Use preserved unit and include production_rate
-                    const cascadeUnit = cascade.unit || 'كيلو';
-                    const cascadeRate = cascade.rate || (actualAmountToAdd / actualTimeToAdd);
-                    const { data: newCascadeTask } = await supabase
-                        .from('tasks')
-                        .insert({
-                            date: cascadeDateStr,
-                            shift: cascadeShiftName,
-                            target_amount: actualAmountToAdd,
-                            target_hours: actualTimeToAdd,
-                            target_unit: cascadeUnit,
-                            target_description: `${cleanProductName} ${actualAmountToAdd} ${cascadeUnit}`,
-                            production_rate: cascadeRate, // 🔧 FIX 5: Add missing production_rate
-                            is_rollover: true,
-                            priority: 0
-                        })
-                        .select()
-                        .single();
-                    console.log(`   ✓ Created new rollover task ${newCascadeTask?.task_id}`);
-                }
-
-                results.push({
-                    type: 'cascade',
-                    from: cascade.fromShift,
-                    to: cascadeShiftName,
-                    product: cascade.productName,
-                    amount: actualAmountToAdd
-                });
-            }
-
-            // Cascade remainder if any
-            if (cascade.time > actualTimeToAdd + 0.05) {
-                const remTime = cascade.time - actualTimeToAdd;
-                const remAmount = cascade.amount - actualAmountToAdd;
-                const { nextShiftName: remNextShift } = getNextShift(cascadeShiftName, cascadeDateStr);
-
-                // 🔧 FIX 2: Preserve unit and rate from parent cascade
+            if (remAmount > 0) {
+                // Still have overflow? Push back to queue for the shift AFTER this one
                 cascadeQueue.push({
-                    fromShift: cascadeShiftName,
-                    toShift: remNextShift,
-                    productName: cascade.productName,
+                    ...item,
                     amount: remAmount,
-                    time: remTime,
-                    rate: cascade.rate || (remAmount / remTime), // Inherit rate from parent
-                    unit: cascade.unit || 'كيلو', // Inherit unit from parent
-                    reason: 'rollover_remainder',
-                    depth: cascadeDepth + 1
+                    fromShift: nextShiftName,
+                    fromDate: nextShiftDate
                 });
             }
 
-        } catch (cascadeErr) {
-            console.error(`❌ Cascade error:`, cascadeErr.message);
+        } catch (err) {
+            console.error("Cascade Loop Error:", err);
         }
     }
 
-    console.log(`✅ AI Rollover Execution complete: ${results.length} operations`);
-    return { results };
+    return results;
 };
 
 module.exports = {
