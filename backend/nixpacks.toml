@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["nodejs_22", "poppler_utils", "imagemagick", "ghostscript"]
+
+[phases.install]
+cmds = ["npm install"]
+
+[start]
+cmd = "node server.js"
