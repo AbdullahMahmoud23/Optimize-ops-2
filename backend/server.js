@@ -48,11 +48,8 @@ const allowedOrigins = [
 
 const corsOptions = {
   origin: function (origin, callback) {
-    console.log('📨 CORS Check for origin:', origin);
-
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) {
-      console.log('✅ No origin provided - allowing request');
       return callback(null, true);
     }
 
@@ -67,11 +64,9 @@ const corsOptions = {
     });
 
     if (isAllowed) {
-      console.log('✅ CORS allowed for origin:', origin);
       callback(null, true);
     } else {
-      console.warn('❌ CORS blocked origin:', origin);
-      callback(null, true); // Still allow for now, frontend can handle
+      callback(null, true);
     }
   },
   credentials: true,
@@ -81,7 +76,6 @@ const corsOptions = {
   maxAge: 86400 // 24 hours
 };
 
-// console.log('✅ Allowed CORS Origins:', allowedOrigins);
 
 // Apply CORS to all routes
 app.use(cors(corsOptions));

@@ -237,18 +237,7 @@ const logRolloverEvent = async (logData) => {
     }
 };
 
-// ============================================
-// منطق التسليم الرئيسي
-// ============================================
 
-/**
- * معالجة تسليم الفترة (التمرير والموازنة)
- * - عدم الإنجاز: تمرير الباقي إلى الفترة التالية، خصم من المهام الأخرى
- * - الإنجاز الزائد: تقليل هدف الفترة التالية، إضافة وقت للمهام الأخرى
- * 
- * @param {number} taskId - معرف المهمة المكتملة
- * @param {number} achievement - قيمة الإنجاز الفعلي
- */
 const handleShiftHandover = async (taskId, achievement) => {
     const operations = []; // تتبع العمليات للتراجع المحتمل
 
@@ -841,109 +830,130 @@ const handleShiftHandover = async (taskId, achievement) => {
         console.error('❌ Error in Shift Handover:', err);
         console.error(`   Operations performed before error: ${operations.length}`);
         console.error('='.repeat(60) + '\n');
-        // Note: True transaction rollback would require Supabase RPC or manual undo
-        // For now, we just log the error and the operations performed
     }
 
 };
 
 
-const executeAIRolloverDecisions = async (decisions, context) => {
+/**
+ * Execute rollover decisions made by the AI (with Cascade support)
+ */
+const executeAIRolloverDecisions = async (decisions, context, cascadeChain = []) => {
     const results = [];
-    const cascadeQueue = []; // The "Domino" Queue
+    const cascadeQueue = [];
 
-    // Helper: Normalize product names for matching
-    const productsMatch = (p1, p2) => {
-        if (!p1 || !p2) return false;
-        const n1 = p1.toLowerCase().replace(/[^a-z0-9]/g, '');
-        const n2 = p2.toLowerCase().replace(/[^a-z0-9]/g, '');
-        return n1.includes(n2) || n2.includes(n1);
-    };
+    const { nextShiftName, nextShiftDate, tasks } = context; 
 
-    // 1. PROCESS INITIAL DECISIONS (The Triggers)
+
     for (const decision of decisions) {
         try {
-            const { nextShiftName, nextShiftDate } = getNextShift(context.currentShift, context.currentDate);
-            
-            // ====================================================
-            // SCENARIO A: SHORTAGE -> ROLLOVER (The Domino)
-            // ====================================================
+
+            if (decision.action === 'none') {
+                results.push({ taskId: decision.taskId, status: 'skipped', reason: decision.reason });
+                continue;
+            }
+
             if (decision.action === 'rollover') {
-                const amountToTransfer = decision.amountToTransfer;
+                const isSameProductSwap = decision.deductFromNextShift &&
+                    decision.deductFromNextShift.productName === decision.productName;
 
-                // Clean Product Name
-                const cleanName = decision.productName.replace(/\[.*?\]|\(.*?\)/g, '').trim();
-
-                // A. Check Next Shift Capacity
-                const { data: nextTasks } = await supabase
+                // Get Next Shift Data
+                const { data: nextShiftTasks } = await supabase
                     .from('tasks')
                     .select('*')
-                    .eq('date', nextShiftDate.toISOString().split('T')[0])
+                    .eq('date', nextShiftDate)
                     .eq('shift', nextShiftName);
 
-                // Calculate Capacity
-                const totalHours = (nextTasks || []).reduce((sum, t) => sum + (t.target_hours || 0), 0);
-                const shiftMaxHours = nextShiftName.includes('Friday') ? 12 : 8; // Simple rule, or use getShiftConfig
-                const availableHours = Math.max(0, shiftMaxHours - totalHours);
-
-                // Calculate Time Needed
-                // Try to find rate from existing task, or context, or fallback
-                const existingTask = (nextTasks || []).find(t => productsMatch(t.target_description, cleanName));
-                let rate = existingTask?.production_rate || 
-                        context.tasks?.find(t => t.taskId === decision.taskId)?.productionRate || 
-                        100;
+                const existingTask = (nextShiftTasks || []).find(t =>
+                    productsMatch(t.target_description, decision.productName)
+                );
                 
-                const hoursNeeded = amountToTransfer / rate;
-
-                // B. Split the Load: What fits? vs What overflows?
-                const hoursToAdd = Math.min(hoursNeeded, availableHours);
-                const amountToAdd = Math.floor(hoursToAdd * rate);
+                // Determine Reliable Production Rate
+                let productRate = 0;
+                if (existingTask) {
+                    productRate = parseFloat(existingTask.production_rate);
+                }
                 
-                const overflowHours = hoursNeeded - hoursToAdd;
-                const overflowAmount = amountToTransfer - amountToAdd;
+                if (!productRate || productRate <= 0) {
+                    const sourceTask = tasks.find(t => t.taskId === decision.taskId);
+                    productRate = parseFloat(sourceTask?.productionRate);
+                    
+                    if (!productRate || productRate <= 0) productRate = 100;
+                }
 
-                // C. Fill the Next Shift (If space exists)
+                // Recalculate Time Needed
+                const realHoursNeeded = decision.amountToTransfer / productRate;
+                
+                const { getShiftDuration } = require('../aiLogic');
+                const SHIFT_CAPACITY = getShiftDuration ? getShiftDuration(nextShiftDate) / 60 : 8;
+                
+                const currentShiftHours = (nextShiftTasks || []).reduce((sum, t) => sum + (parseFloat(t.target_hours) || 0), 0);
+                const availableHours = Math.max(0, SHIFT_CAPACITY - currentShiftHours);
+
+                // Fit & Cascade
+                const hoursToAdd = Math.min(realHoursNeeded, availableHours);
+                let amountToAdd = Math.round(hoursToAdd * productRate);
+                amountToAdd = Math.min(amountToAdd, decision.amountToTransfer);
+                
+                if (availableHours < 0.25) amountToAdd = 0;
+
+                const overflowAmount = decision.amountToTransfer - amountToAdd;
+                const overflowHours = overflowAmount / productRate;
+
+                // Add to Next Shift
                 if (amountToAdd > 0) {
+                    const cleanProductName = decision.productName.replace(/\[.*?\]|\(.*?\)/g, '').trim();
                     if (existingTask) {
-                        // Merge
+                        const newAmount = parseFloat(existingTask.target_amount) + amountToAdd;
+                        const newHours = parseFloat(existingTask.target_hours || 0) + hoursToAdd;
+                        
                         await executeWithRetry(() => supabase.from('tasks').update({
-                            target_amount: existingTask.target_amount + amountToAdd,
-                            target_hours: existingTask.target_hours + hoursToAdd,
-                            target_description: `${cleanName} ${existingTask.target_amount + amountToAdd} [Rollover]`
+                            target_amount: newAmount,
+                            target_hours: newHours,
+                            target_description: `${cleanProductName} ${newAmount} ${existingTask.target_unit} [Rollover]`,
+                            is_rollover: true,
+                            priority: 0
                         }).eq('task_id', existingTask.task_id));
+                        
+                        console.log(`   ✅ Merged ${amountToAdd} units into Shift 2`);
                     } else {
-                        // Insert
+                        const sourceTask = tasks.find(t => t.taskId === decision.taskId);
+                        
                         await executeWithRetry(() => supabase.from('tasks').insert({
                             date: nextShiftDate,
                             shift: nextShiftName,
                             target_amount: amountToAdd,
                             target_hours: hoursToAdd,
-                            target_unit: 'kg', // Default or fetch from context
-                            target_description: `${cleanName} ${amountToAdd} [Rollover]`,
-                            production_rate: rate,
-                            priority: 0, // High priority
-                            is_rollover: true
+                            target_unit: sourceTask?.targetUnit || 'كيلو',
+                            target_description: `${cleanProductName} ${amountToAdd} ${sourceTask?.targetUnit || 'كيلو'} [Rollover]`,
+                            production_rate: productRate,
+                            is_rollover: true,
+                            priority: 0,
+                            original_task_id: decision.taskId
                         }));
                     }
-                    console.log(`   ✅ Moved ${amountToAdd} units to ${nextShiftName}`);
                 }
 
-                // D. Trigger Cascade for Overflow
+                // Handle Overflow (Cascade)
                 if (overflowAmount > 0) {
+                    const cleanProductName = decision.productName.replace(/\[.*?\]|\(.*?\)/g, '').trim();
+                    const sourceTask = tasks.find(t => t.taskId === decision.taskId);
+                    
                     cascadeQueue.push({
-                        productName: cleanName,
+                        productName: cleanProductName,
                         amount: overflowAmount,
                         time: overflowHours,
-                        rate: rate,
+                        rate: productRate,
+                        unit: sourceTask?.targetUnit || 'كيلو',
                         fromShift: nextShiftName,
-                        fromDate: nextShiftDate
+                        fromDate: nextShiftDate,
+                        reason: 'capacity_overflow',
+                        depth: 0
                     });
                 }
-
-                results.push({ taskId: decision.taskId, status: 'rolled_over', cascaded: overflowAmount > 0 });
+                
+                results.push({ taskId: decision.taskId, status: 'processed', added: amountToAdd, cascaded: overflowAmount });
             }
-
-            // SCENARIO B: SURPLUS -> BALANCE (The Extinguisher)
             else if (decision.action === 'balance') {
                 let flame = decision.amountToTransfer;
 
@@ -979,8 +989,7 @@ const executeAIRolloverDecisions = async (decisions, context) => {
                             target_hours: newHours,
                             target_description: `${cleanName} ${newAmount} [Reduced]`
                         }).eq('task_id', task.task_id));
-                        
-                        console.log(`   ✂️ Reduced task in ${task.shift} to ${newAmount}`);
+
                         flame = 0;
                     }
                 }
@@ -988,10 +997,10 @@ const executeAIRolloverDecisions = async (decisions, context) => {
             }
 
         } catch (err) {
-            console.error(`❌ Decision Logic Error:`, err);
+            console.error(`❌ Error executing decision for task ${decision.taskId}:`, err.message);
+            results.push({ taskId: decision.taskId, status: 'error', reason: err.message });
         }
     }
-
 
     // This loop handles the overflow from Scenario A
     let loops = 0;
@@ -1050,8 +1059,8 @@ const executeAIRolloverDecisions = async (decisions, context) => {
             console.error("Cascade Loop Error:", err);
         }
     }
-
-    return results;
+    
+    return { results };
 };
 
 module.exports = {

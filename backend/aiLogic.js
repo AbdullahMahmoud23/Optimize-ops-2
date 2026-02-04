@@ -8,18 +8,7 @@ require("dotenv").config();
 const { File } = require('node:buffer');
 globalThis.File = File;
 
-// ============================================
-// 🚀 AI RETRY LOGIC & FALLBACK
-// ============================================
 
-/**
- * Execute AI operation with retry and fallback
- * @param {Function} primaryOp - Primary operation (Groq)
- * @param {Function} fallbackOp - Fallback operation (OpenRouter/GPT)
- * @param {string} operationName - Name for logging
- * @param {number} maxRetries - Max retries (default: 3)
- * @returns {Promise} Result or null if all fail
- */
 const executeWithFallback = async (primaryOp, fallbackOp, operationName = 'AI Operation', maxRetries = 3) => {
     let lastError;
     
@@ -57,9 +46,7 @@ const executeWithFallback = async (primaryOp, fallbackOp, operationName = 'AI Op
     }
 };
 
-/**
- * Check if error is transient (can be retried)
- */
+
 const isTransientError = (error) => {
     const message = error?.message || '';
     const status = error?.status;
@@ -96,7 +83,7 @@ const groqClient = new OpenAI({
 
 const reasoningClient = new OpenAI({
     apiKey: process.env.OPENROUTER_API_KEY,
-    baseURL: process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1",
+    baseURL: "https://openrouter.ai/api/v1",
     defaultHeaders: {
         "HTTP-Referer": process.env.OPENROUTER_REFERER || "http://localhost:3000",
         "X-Title": "Factory Ops AI",
@@ -558,33 +545,30 @@ async function analyzePerformance(transcript, orderCount = 1) {
     `;
 
     try {
-        // 🚀 Primary: Groq (fastest, cheaper)
         const primaryAnalyze = async () => {
-            const completion = await groqClient.chat.completions.create({
-                model: "llama-3.3-70b-versatile",
-                messages: [
-                    { role: "system", content: systemPrompt },
-                    { role: "user", content: transcript },
-                ],
-                response_format: { type: "json_object" },
-            });
-            return JSON.parse(completion.choices[0].message.content);
-        };
-
-        // Fallback: OpenRouter if Groq fails
-        const fallbackAnalyze = async () => {
             const completion = await reasoningClient.chat.completions.create({
-                model: "google/gemini-2.0-flash-exp:free", // or another available model
+                model: "x-ai/grok-beta",
                 messages: [
-                    { role: "system", content: systemPrompt },
-                    { role: "user", content: transcript },
+                    { role: "system", content: "You are a Factory Supervisor Agent. Response must be valid JSON only." },
+                    { role: "user", content: prompt }
                 ],
                 response_format: { type: "json_object" },
+                temperature: 0.2
             });
-            return JSON.parse(completion.choices[0].message.content);
         };
 
-        // 🚀 Execute with retry + fallback
+        const fallbackAnalyze = async () => {
+            console.log('⚠️ Grok unavailable, using Gemini Fallback...');
+            const completion = await reasoningClient.chat.completions.create({
+                model: "google/gemini-flash-1.5",
+                messages: [
+                    { role: "system", content: "Return JSON only." },
+                    { role: "user", content: prompt }
+                ],
+                response_format: { type: "json_object" }
+            });
+        };
+
         const result = await executeWithFallback(
             primaryAnalyze,
             fallbackAnalyze,
@@ -836,21 +820,7 @@ function formatShiftTime(minutes) {
     return `${hours} ساعة و ${mins} دقيقة`;
 }
 
-// 8. Calculate Overall Score - CORRECT FORMULA
-// Formula:
-//   الوقت الفعلي = 480 - وقت الأعطال المسموح فقط (التأخير لا يُخصم)
-//   التارجت المعدل = التارجت × (الوقت الفعلي / 480)
-//   نسبة الإنجاز = الإنجاز الفعلي / التارجت المعدل
-//   لو >= 100% → 100%
-//   لو < 100% → نسبة الإنجاز
-//
-// Parameters:
-//   target: Target value (e.g., 100 pieces)
-//   actualAchievement: What was actually achieved (e.g., 90 pieces)
-//   allowedFaultTime: Time deducted for allowed faults (in minutes)
-//   delayTime: Extra time over allowed (NOT deducted from shift, just for info)
-//   shiftDuration: Total shift duration (default 480 minutes)
-//
+
 function calculateOverallScore(target, actualAchievement, allowedFaultTime = 0, delayTime = 0, shiftDuration = 480) {
     // Step 1: Calculate actual working time (delay is NOT deducted)
     const actualWorkingTime = Math.max(0, shiftDuration - allowedFaultTime);
@@ -922,7 +892,7 @@ function calculateOverallScore(target, actualAchievement, allowedFaultTime = 0, 
     };
 }
 
-// 9. AI-Powered Rollover Analysis
+// AI-Powered Rollover Analysis
 async function analyzeShiftRollover(shiftData) {
     const { shift, date, tasks, nextShift } = shiftData;
 
@@ -939,20 +909,20 @@ async function analyzeShiftRollover(shiftData) {
 
     const prompt = `أنت مشرف مصنع ذكي. حلل نتائج الوردية وقرر الـ Rollover.
 
-📊 بيانات الوردية الحالية:
+ بيانات الوردية الحالية:
 - التاريخ: ${date}
 - الوردية: ${shift}
 
-📋 المهام والإنجازات:
+ المهام والإنجازات:
 ${tasksSummary}
 
-📅 الورديات المتاحة للـ Cascade:
+ الورديات المتاحة للـ Cascade:
 🔹 الوردية التالية: ${nextShift.name} (${nextShift.date})
 ${nextShift.tasks?.length ? nextShift.tasks.map(t => `   - ${t.productName}: ${t.targetAmount} ${t.targetUnit}`).join('\n') : '   (لا توجد مهام)'}
 
-⚠️⚠️⚠️ قاعدة أساسية: لا تتجاوز 8 ساعات في أي وردية! ⚠️⚠️⚠️
+ قاعدة أساسية: لا تتجاوز 8 ساعات في أي وردية! 
 
-🔄 القواعد:
+ القواعد:
 1. العجز (Shortage) -> "rollover": رحّل الكمية المتبقية للوردية التالية.
 2. الفائض (Surplus) -> "balance": اخصم الكمية الزائدة من مهام المستقبل (Extinguish Queue).
 
@@ -972,59 +942,54 @@ ${nextShift.tasks?.length ? nextShift.tasks.map(t => `   - ${t.productName}: ${t
   "summary": "ملخص عربي"
 }`;
 
-    // 2. Execution Logic (Grok 4.1 Specific)
     try {
-        console.log('🤖 AI Rollover Agent starting (Model: Grok 2-1212)...');
-
-        // A. Define Primary: Grok 2 (which is 4.1 beta on OpenRouter)
         const primaryAnalyze = async () => {
             const completion = await reasoningClient.chat.completions.create({
-                model: "x-ai/grok-2-1212",
+                model: "x-ai/grok-4.1-fast",
                 messages: [
-                    { role: "system", content: "You are a Factory Supervisor Agent. Response must be valid JSON only." },
+                    { role: "system", content: "You are a Factory Supervisor Agent. Response must be valid JSON only. Do not use Markdown." },
                     { role: "user", content: prompt }
                 ],
                 response_format: { type: "json_object" },
-                temperature: 0.2 // Slightly higher for reasoning
+                temperature: 0.2
             });
 
             const content = completion.choices[0].message.content;
-            // Clean Markdown if Grok adds it
-            const jsonMatch = content.match(/\{[\s\S]*\}/);
-            return jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(content);
+            return JSON.parse(content);
         };
 
-        // B. Define Fallback: Gemini 2.0 - If Grok fails
         const fallbackAnalyze = async () => {
-            console.log('⚠️ Grok unavailable, using Gemini Fallback...');
             const completion = await reasoningClient.chat.completions.create({
-                model: "google/gemini-2.0-flash-exp:free",
+                model: "google/gemini-3-flash-preview",
                 messages: [
-                    { role: "system", content: "Return JSON only." },
+                    { role: "system", content: "Return valid JSON only." },
                     { role: "user", content: prompt }
                 ],
                 response_format: { type: "json_object" }
             });
             const content = completion.choices[0].message.content;
+            
+            // Cleanup Markdown if present
             const jsonMatch = content.match(/\{[\s\S]*\}/);
             return jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(content);
         };
 
-        // C. Execute
+        // Execute with Retry
         let result = await executeWithFallback(
             primaryAnalyze,
             fallbackAnalyze,
-            'Rollover Agent (Grok)',
+            'Rollover Agent (Grok 4.1)',
             2
         );
 
         if (!result) throw new Error('Agent returned empty response');
 
-        // D. Validate Structure
+        // Structure Validation
         if (!result.decisions || !Array.isArray(result.decisions)) {
-            // Fix common AI structure error
             if (result.result && result.result.decisions) {
                 result = result.result;
+            } else if (result.decisions && !Array.isArray(result.decisions)) {
+                result.decisions = [result.decisions];
             } else {
                 throw new Error('Invalid JSON structure from Agent');
             }
@@ -1034,7 +999,7 @@ ${nextShift.tasks?.length ? nextShift.tasks.map(t => `   - ${t.productName}: ${t
         return result;
 
     } catch (error) {
-        console.error('❌ Agent Failed. Switching to OFFLINE MATH MODE:', error.message);
+        console.error('❌ Switching to OFFLINE MODE:', error.message);
         return offlineRolloverAnalysis(shiftData);
     }
 }
@@ -1042,21 +1007,27 @@ ${nextShift.tasks?.length ? nextShift.tasks.map(t => `   - ${t.productName}: ${t
 // OFFLINE FALLBACK
 // Calculates rollover using simple math if AI is down
 function offlineRolloverAnalysis(shiftData) {
-    console.log('⚠️ Entering Offline Math Mode (AI Unavailable)...');
-    
     const { tasks } = shiftData;
     const decisions = [];
     const summaryParts = [];
 
     tasks.forEach(task => {
         const diff = task.achievement - task.targetAmount;
-        const tolerance = 5; // Ignore +/- 5 units
+        const tolerance = 5; 
 
         // CASE 1: Shortage (Rollover)
         if (diff < -tolerance) {
             const amount = Math.abs(diff);
-            // Use task.productionRate or fallback to 1 to avoid division by zero
-            const rate = task.productionRate || 1; 
+            
+            // 🔧 FIX: Better Rate Estimation
+            // 1. Use provided rate
+            // 2. Or calculate from target (assuming 8h shift)
+            // 3. Or fallback to 100 (never 1)
+            let rate = task.productionRate;
+            if (!rate || rate <= 0) {
+                rate = (task.targetAmount > 0) ? (task.targetAmount / 8) : 100;
+            }
+            
             const time = amount / rate;
             
             decisions.push({
@@ -1072,7 +1043,11 @@ function offlineRolloverAnalysis(shiftData) {
         // CASE 2: Surplus (Balance)
         else if (diff > tolerance) {
             const amount = Math.abs(diff);
-            const rate = task.productionRate || 1;
+            
+            let rate = task.productionRate;
+            if (!rate || rate <= 0) {
+                rate = (task.targetAmount > 0) ? (task.targetAmount / 8) : 100;
+            }
             const time = amount / rate;
             
             decisions.push({
@@ -1085,7 +1060,6 @@ function offlineRolloverAnalysis(shiftData) {
             });
             summaryParts.push(`خصم فائض ${amount} من ${task.productName}`);
         }
-        // CASE 3: On Target
         else {
             decisions.push({
                 taskId: task.taskId,
@@ -1100,9 +1074,9 @@ function offlineRolloverAnalysis(shiftData) {
 
     return {
         decisions: decisions,
-        cascadeChain: [], // No complex cascade in offline mode
+        cascadeChain: [],
         summary: summaryParts.length > 0 ? summaryParts.join('، ') : 'تم تحقيق المستهدف',
-        fallback: true // Flag to tell frontend this was offline
+        fallback: true
     };
 }
 
